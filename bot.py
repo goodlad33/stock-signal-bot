@@ -27,7 +27,13 @@ LUNARCRUSH_API_KEY = os.environ.get("LUNARCRUSH_API_KEY")
 
 STATE_FILE       = Path("/tmp/bot_state.json")
 COOLDOWN_HOURS   = 4
-DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MA", "META", "MSFT"]
+DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MA", "META", "MSFT", "TSLA"]
+
+SWEEP_TIMES_ET = {
+    (9,  45): "Morning Sweep",
+    (12, 30): "Midday Sweep",
+    (15, 30): "Pre-Close Sweep",
+}
 
 # Conversation states
 (ASK_TICKER, ASK_PRICE, ASK_SIZE, ASK_CONFIRM,
@@ -66,6 +72,7 @@ def get_chat_state(state: dict, chat_id: int) -> dict:
         state[key] = {
             "tickers": list(DEFAULT_WATCHLIST),
             "threshold": DEFAULT_THRESHOLD,
+            "thresholds": {},
             "paused": False,
             "entries": {},
             "cooldowns": {},
@@ -75,14 +82,18 @@ def get_chat_state(state: dict, chat_id: int) -> dict:
             "pending_follow_ups": [],
             "earnings_blackout_notified": {},
         }
-    # Backfill new keys for existing states
     cs = state[key]
     cs.setdefault("capital", 100.0)
     cs.setdefault("pending_follow_ups", [])
     cs.setdefault("earnings_blackout_notified", {})
     cs.setdefault("trade_log", [])
     cs.setdefault("signal_log", [])
+    cs.setdefault("thresholds", {})
     return cs
+
+
+def get_ticker_threshold(cs: dict, ticker: str) -> float:
+    return cs.get("thresholds", {}).get(ticker, cs.get("threshold", DEFAULT_THRESHOLD))
 
 
 state = load_state()
@@ -171,6 +182,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/unwatch NVDA` — remove ticker\n"
         "• `/list` — watchlist and positions\n"
         "• `/check NVDA` — instant deep analysis\n"
+        "• `/scan` — ranked overview of full watchlist now\n"
         "• `/brief` — morning analysis of all stocks\n"
         "• `/bought` — log a buy\n"
         "• `/sold` — log a sale\n"
@@ -179,7 +191,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/capital 500` — set your total capital\n"
         "• `/pause` — silence alerts\n"
         "• `/resume` — re-enable alerts\n"
-        "• `/threshold 2.0` — change price move threshold\n"
+        "• `/threshold 2.0` — global price move threshold\n"
+        "• `/threshold TSLA 2.5` — per-ticker threshold\n"
         "• `/help` — show this message\n\n"
         f"_Default watchlist: {', '.join(DEFAULT_WATCHLIST)}_",
         parse_mode="Markdown"
@@ -348,13 +361,51 @@ async def resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def threshold_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    try:
-        val = float(ctx.args[0])
-        get_chat_state(state, chat_id)["threshold"] = val
-        save_state(state)
-        await update.message.reply_text(f"✅ Threshold set to ±{val}%")
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: `/threshold 2.0`", parse_mode="Markdown")
+    cs = get_chat_state(state, chat_id)
+    args = ctx.args
+
+    if not args:
+        lines = [f"⚡ *Thresholds*\n\nGlobal default: ±{cs.get('threshold', DEFAULT_THRESHOLD)}%"]
+        if cs.get("thresholds"):
+            lines.append("\nPer-ticker overrides:")
+            for t, v in cs["thresholds"].items():
+                lines.append(f"• {t}: ±{v}%")
+        lines.append("\n_Usage:_\n`/threshold 2.0` — global\n`/threshold TSLA 2.5` — per ticker")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    if len(args) == 1:
+        if args[0].replace(".", "").isdigit():
+            try:
+                val = float(args[0])
+                cs["threshold"] = val
+                save_state(state)
+                await update.message.reply_text(f"✅ Global threshold set to ±{val}%")
+            except ValueError:
+                await update.message.reply_text("Usage: `/threshold 2.0`", parse_mode="Markdown")
+        else:
+            ticker = args[0].upper()
+            thresh = cs.get("thresholds", {}).get(ticker, cs.get("threshold", DEFAULT_THRESHOLD))
+            source = "per-ticker" if ticker in cs.get("thresholds", {}) else "global default"
+            await update.message.reply_text(
+                f"*{ticker}* threshold: ±{thresh}% ({source})\n\nTo change: `/threshold {ticker} 2.5`",
+                parse_mode="Markdown"
+            )
+        return
+
+    if len(args) == 2:
+        ticker = args[0].upper()
+        try:
+            val = float(args[1])
+            cs.setdefault("thresholds", {})[ticker] = val
+            save_state(state)
+            await update.message.reply_text(
+                f"✅ *{ticker}* threshold set to ±{val}%\n"
+                f"_Global default remains ±{cs.get('threshold', DEFAULT_THRESHOLD)}%_",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await update.message.reply_text("Usage: `/threshold TSLA 2.5`", parse_mode="Markdown")
 
 
 # ------------------------------------------------------------------ #
@@ -608,6 +659,44 @@ async def sold_review(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    cs = get_chat_state(state, chat_id)
+    tickers = sorted(cs["tickers"])
+    if not tickers:
+        await update.message.reply_text("No tickers on watchlist.", parse_mode="Markdown")
+        return
+    await update.message.reply_text(f"⏳ Scanning {', '.join(tickers)}...")
+    result = await analyzer.scan_watchlist(tickers, cs.get("entries"))
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+
+async def scheduled_sweep(ctx: ContextTypes.DEFAULT_TYPE):
+    n = now_et()
+    if n.weekday() >= 5:
+        return
+    label = SWEEP_TIMES_ET.get((n.hour, n.minute))
+    if not label:
+        return
+    for chat_id_str, cs in list(state.items()):
+        try:
+            chat_id = int(chat_id_str)
+        except ValueError:
+            continue
+        if cs.get("paused"):
+            continue
+        try:
+            tickers = cs.get("tickers", [])
+            if not tickers:
+                continue
+            result = await analyzer.get_sweep_summary(tickers, cs.get("entries"))
+            await ctx.application.bot.send_message(
+                chat_id=chat_id, text=result, parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Sweep error {chat_id}: {e}")
+
+
 # ------------------------------------------------------------------ #
 #  THESIS FOLLOW-UP                                                    #
 # ------------------------------------------------------------------ #
@@ -716,7 +805,7 @@ async def scheduled_check(ctx: ContextTypes.DEFAULT_TYPE):
                 entry = cs["entries"].get(ticker)
                 msg, strength, signal_type = await analyzer.run(
                     ticker,
-                    threshold=cs.get("threshold", DEFAULT_THRESHOLD),
+                    threshold=get_ticker_threshold(cs, ticker),
                     force=False,
                     entry=entry,
                 )
@@ -778,7 +867,7 @@ async def morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
     now = now_uk()
     if now.weekday() >= 5:
         return
-    if not (now.hour == 8 and 54 <= now.minute <= 56):
+    if not (now.hour == 13 and 54 <= now.minute <= 56):
         return
     for chat_id_str, cs in list(state.items()):
         try:
@@ -790,6 +879,7 @@ async def morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
         try:
             tickers = cs.get("tickers", [])
             pulse   = analyzer.get_market_pulse(tickers, cs.get("entries"))
+            brief   = analyzer.get_brief(tickers, cs.get("entries"))
             entries_note = ""
             if cs.get("entries"):
                 entries_note = "\n📌 Open: " + ", ".join(
@@ -798,11 +888,15 @@ async def morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.application.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"🌅 *Good morning — Market opens in 35 minutes*\n\n"
+                    f"🌅 *Good afternoon — US market opens in 35 minutes*\n\n"
                     f"{pulse}"
-                    f"{entries_note}\n\n"
-                    f"_Use /brief for full stock analysis._"
+                    f"{entries_note}"
                 ),
+                parse_mode="Markdown"
+            )
+            await ctx.application.bot.send_message(
+                chat_id=chat_id,
+                text=f"📋 *Pre-Market Brief*\n\n{brief}",
                 parse_mode="Markdown"
             )
         except Exception as e:
@@ -879,6 +973,7 @@ def main():
     app.add_handler(CommandHandler("unwatch",   unwatch))
     app.add_handler(CommandHandler("list",      list_cmd))
     app.add_handler(CommandHandler("check",     check))
+    app.add_handler(CommandHandler("scan",      scan))
     app.add_handler(CommandHandler("brief",     brief))
     app.add_handler(CommandHandler("entries",   entries_cmd))
     app.add_handler(CommandHandler("trades",    trades_cmd))
@@ -890,6 +985,7 @@ def main():
     app.job_queue.run_repeating(scheduled_check,    interval=1800, first=60)
     app.job_queue.run_repeating(morning_ping,        interval=60,   first=30)
     app.job_queue.run_repeating(weekly_summary_job,  interval=60,   first=30)
+    app.job_queue.run_repeating(scheduled_sweep,     interval=60,   first=45)
 
     logger.info("Signal bot started — full stack active.")
     app.run_polling()
