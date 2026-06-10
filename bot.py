@@ -672,7 +672,8 @@ async def scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def scheduled_sweep(ctx: ContextTypes.DEFAULT_TYPE):
-    n = now_et()
+    from zoneinfo import ZoneInfo
+    n = datetime.now(ZoneInfo("America/New_York"))
     if n.weekday() >= 5:
         return
     label = SWEEP_TIMES_ET.get((n.hour, n.minute))
