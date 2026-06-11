@@ -21,9 +21,10 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
-POLYGON_API_KEY    = os.environ["POLYGON_API_KEY"]
+POLYGON_API_KEY    = os.environ.get("POLYGON_API_KEY")
 ALPHA_VANTAGE_KEY  = os.environ.get("ALPHA_VANTAGE_KEY")
 LUNARCRUSH_API_KEY = os.environ.get("LUNARCRUSH_API_KEY")
+FINNHUB_API_KEY    = os.environ.get("FINNHUB_API_KEY")
 
 STATE_FILE       = Path("/tmp/bot_state.json")
 COOLDOWN_HOURS   = 4
@@ -41,7 +42,8 @@ SWEEP_TIMES_ET = {
 
 analyzer = SignalAnalyzer(
     ANTHROPIC_API_KEY, POLYGON_API_KEY,
-    ALPHA_VANTAGE_KEY, LUNARCRUSH_API_KEY
+    ALPHA_VANTAGE_KEY, LUNARCRUSH_API_KEY,
+    FINNHUB_API_KEY
 )
 
 # ------------------------------------------------------------------ #
