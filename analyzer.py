@@ -1,3 +1,4 @@
+import asyncio
 import anthropic
 import httpx
 import logging
@@ -64,9 +65,11 @@ def strength_stars(strength: int) -> str:
 
 class SignalAnalyzer:
     def __init__(self, anthropic_key: str, polygon_key: str,
-                 alpha_vantage_key: str = None, lunarcrush_key: str = None):
+                 alpha_vantage_key: str = None, lunarcrush_key: str = None,
+                 finnhub_key: str = None):
         self.claude = anthropic.Anthropic(api_key=anthropic_key)
         self.polygon_key = polygon_key
+        self.finnhub_key = finnhub_key
         self.alpha_vantage_key = alpha_vantage_key
         self.lunarcrush_key = lunarcrush_key if lunarcrush_key != "placeholder" else None
 
@@ -75,23 +78,17 @@ class SignalAnalyzer:
     # ------------------------------------------------------------------ #
 
     async def get_price_change(self, ticker: str) -> dict:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(hours=2)
-        url = (
-            f"{POLYGON_BASE}/aggs/ticker/{ticker}/range/30/minute"
-            f"/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
-        )
-        params = {"adjusted": "true", "sort": "asc", "limit": 4, "apiKey": self.polygon_key}
+        url = "https://finnhub.io/api/v1/quote"
+        params = {"symbol": ticker, "token": self.finnhub_key}
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(url, params=params)
                 data = r.json()
-            bars = data.get("results", [])
-            if len(bars) < 2:
+            current = data.get("c", 0)
+            previous = data.get("pc", 0)
+            if not current or not previous:
                 return {}
-            current = bars[-1]["c"]
-            previous = bars[-2]["c"]
-            change_pct = ((current - previous) / previous) * 100 if previous else 0
+            change_pct = ((current - previous) / previous) * 100
             return {
                 "ticker": ticker,
                 "current": round(current, 2),
@@ -100,7 +97,7 @@ class SignalAnalyzer:
                 "change_pct": round(change_pct, 2),
             }
         except Exception as e:
-            logger.error(f"Polygon price error for {ticker}: {e}")
+            logger.error(f"Finnhub price error for {ticker}: {e}")
             return {}
 
     # ------------------------------------------------------------------ #
@@ -542,6 +539,184 @@ Under 100 words. Direct, factual, no fluff."""
             f"Monitoring resumes after the report._\n\n"
             f"⏱ {now}"
         )
+
+    # ------------------------------------------------------------------ #
+    #  SCAN — on-demand ranked overview of full watchlist                 #
+    # ------------------------------------------------------------------ #
+
+    async def scan_watchlist(self, tickers: list, entries: dict = None) -> str:
+        """
+        Full on-demand scan. Gets prices in parallel, sentiment sequentially.
+        Returns tickers ranked by combined price + sentiment score.
+        """
+        price_tasks = [self.get_price_change(t) for t in tickers]
+        prices = await asyncio.gather(*price_tasks, return_exceptions=True)
+        price_map = {
+            t: p for t, p in zip(tickers, prices)
+            if isinstance(p, dict) and p
+        }
+        market_context = await self.get_market_context()
+
+        results = []
+        for ticker in tickers:
+            price_data = price_map.get(ticker, {})
+            lunar      = await self.get_lunarcrush_sentiment(ticker)
+            sentiment  = self.get_sentiment(ticker, market_context, lunar)
+            pct        = price_data.get("change_pct", 0) if price_data else 0
+            confidence = sentiment.get("confidence", 0)
+            score      = abs(pct) * confidence
+            results.append({
+                "ticker":       ticker,
+                "price_data":   price_data,
+                "sentiment":    sentiment,
+                "pct":          pct,
+                "confidence":   confidence,
+                "s":            sentiment.get("sentiment", "neutral"),
+                "momentum":     sentiment.get("momentum", "steady"),
+                "thesis_status":sentiment.get("thesis_status", "intact"),
+                "score":        score,
+            })
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+        now = now_uk().strftime("%b %d, %H:%M") + " UK"
+        lines = [f"📡 *Watchlist Scan — {now}*\n"]
+
+        if market_context.get("context") != "unknown":
+            lines.append(
+                f"🌍 Market: *{market_context['context']}* "
+                f"(SPY {market_context['spy_pct']:+.1f}% · "
+                f"QQQ {market_context['qqq_pct']:+.1f}%)\n"
+            )
+
+        for i, r in enumerate(results, 1):
+            ticker       = r["ticker"]
+            pct          = r["pct"]
+            s            = r["s"]
+            confidence   = r["confidence"]
+            momentum     = r["momentum"]
+            thesis_status = r["thesis_status"]
+            sign         = "+" if pct >= 0 else ""
+
+            if pct >= 1.5 and s == "bullish":
+                direction = "🚀"
+            elif pct >= 0.3:
+                direction = "📈"
+            elif pct <= -1.5 and s == "bearish":
+                direction = "🔻"
+            elif pct <= -0.3:
+                direction = "📉"
+            else:
+                direction = "🟡"
+
+            thesis_flag = " ⚠️" if thesis_status == "under_review" else " ✗" if thesis_status == "broken" else ""
+
+            position_str = ""
+            entry = (entries or {}).get(ticker)
+            if entry and r["price_data"]:
+                current    = r["price_data"]["current"]
+                gain_pct   = ((current - entry["entry_price"]) / entry["entry_price"]) * 100
+                gain_sign  = "+" if gain_pct >= 0 else ""
+                position_str = f" · pos {gain_sign}{gain_pct:.1f}%"
+
+            lines.append(
+                f"{i}. {direction} *{ticker}* {sign}{pct:.1f}% · "
+                f"{s.capitalize()} {confidence}/10 · {momentum}"
+                f"{thesis_flag}{position_str}"
+            )
+
+        # Top opportunity callout
+        top = results[0] if results else None
+        if top and top["s"] != "neutral" and top["confidence"] >= MIN_CONFIDENCE:
+            lines.append(
+                f"\n_Top opportunity: *{top['ticker']}* — "
+                f"price and sentiment aligned. Use /check {top['ticker']} for full analysis._"
+            )
+        elif top:
+            lines.append("\n_No strong signals right now. Market appears quiet._")
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
+    #  SWEEP — lightweight scheduled market overview                      #
+    # ------------------------------------------------------------------ #
+
+    async def get_sweep_summary(self, tickers: list, entries: dict = None) -> str:
+        """
+        Lightweight sweep: prices in parallel, sentiment only for movers >1%.
+        Used for scheduled 3x daily market overviews.
+        """
+        price_tasks = [self.get_price_change(t) for t in tickers]
+        prices      = await asyncio.gather(*price_tasks, return_exceptions=True)
+        price_map   = {
+            t: p for t, p in zip(tickers, prices)
+            if isinstance(p, dict) and p
+        }
+        market_context = await self.get_market_context()
+
+        n_et     = now_et()
+        n_uk     = now_uk()
+        et_str   = n_et.strftime("%I:%M %p ET")
+        uk_str   = n_uk.strftime("%b %d, %H:%M UK")
+        lines    = [f"📊 *Market Sweep — {et_str} ({uk_str})*\n"]
+
+        if market_context.get("context") != "unknown":
+            lines.append(
+                f"🌍 *Market: {market_context['context']}* "
+                f"(SPY {market_context['spy_pct']:+.1f}% · "
+                f"QQQ {market_context['qqq_pct']:+.1f}%)\n"
+            )
+
+        # Sort by absolute move
+        ticker_moves = []
+        for ticker in tickers:
+            pd  = price_map.get(ticker, {})
+            pct = pd.get("change_pct", 0) if pd else 0
+            ticker_moves.append((ticker, pct, pd))
+        ticker_moves.sort(key=lambda x: abs(x[1]), reverse=True)
+
+        lines.append("*Your watchlist:*")
+        active_tickers = []
+
+        for ticker, pct, price_data in ticker_moves:
+            sign = "+" if pct >= 0 else ""
+            if abs(pct) >= 1.0:
+                direction = "🚀" if pct >= 0 else "🔻"
+                active_tickers.append(ticker)
+            elif abs(pct) >= 0.3:
+                direction = "📈" if pct >= 0 else "📉"
+            else:
+                direction = "🟡"
+
+            entry = (entries or {}).get(ticker)
+            position_str = ""
+            if entry and price_data:
+                gain_pct   = ((price_data["current"] - entry["entry_price"]) / entry["entry_price"]) * 100
+                gain_sign  = "+" if gain_pct >= 0 else ""
+                position_str = f" · pos {gain_sign}{gain_pct:.1f}%"
+
+            lines.append(f"{direction} *{ticker}* {sign}{pct:.1f}%{position_str}")
+
+        # Next sweep time
+        et_hm        = n_et.hour * 60 + n_et.minute
+        sweep_times  = [(9, 45), (12, 30), (15, 30)]
+        next_sweep   = next(
+            (f"{h:02d}:{m:02d} ET" for h, m in sweep_times if h * 60 + m > et_hm),
+            None
+        )
+
+        if active_tickers:
+            lines.append(
+                f"\n_Active movers: {', '.join(active_tickers)} — "
+                f"use /check or /scan for deeper analysis_"
+            )
+        else:
+            lines.append("\n_No significant moves. Market quiet._")
+
+        if next_sweep:
+            lines.append(f"_Next sweep: {next_sweep}_")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
     #  SIGNAL EVALUATION                                                   #
