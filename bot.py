@@ -872,6 +872,7 @@ async def morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
         return
     if not (now.hour == 13 and 54 <= now.minute <= 56):
         return
+    today = now.strftime("%Y-%m-%d")
     for chat_id_str, cs in list(state.items()):
         try:
             chat_id = int(chat_id_str)
@@ -879,10 +880,12 @@ async def morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
             continue
         if cs.get("paused"):
             continue
+        # Fire exactly once per day
+        if cs.get("morning_ping_sent") == today:
+            continue
         try:
             tickers = cs.get("tickers", [])
             pulse   = analyzer.get_market_pulse(tickers, cs.get("entries"))
-            brief   = analyzer.get_brief(tickers, cs.get("entries"))
             entries_note = ""
             if cs.get("entries"):
                 entries_note = "\n📌 Open: " + ", ".join(
@@ -897,11 +900,16 @@ async def morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
                 ),
                 parse_mode="Markdown"
             )
-            await ctx.application.bot.send_message(
-                chat_id=chat_id,
-                text=f"📋 *Pre-Market Brief*\n\n{brief}",
-                parse_mode="Markdown"
-            )
+            # Send brief as one message per stock to avoid Telegram 4096 char limit
+            for ticker in tickers:
+                ticker_brief = analyzer.get_brief([ticker], cs.get("entries"))
+                await ctx.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📋 *{ticker} — Pre-Market Brief*\n\n{ticker_brief}",
+                    parse_mode="Markdown"
+                )
+            cs["morning_ping_sent"] = today
+            save_state(state)
         except Exception as e:
             logger.error(f"Morning ping error {chat_id}: {e}")
 
@@ -912,10 +920,14 @@ async def weekly_summary_job(ctx: ContextTypes.DEFAULT_TYPE):
         return
     if not (now.hour == 21 and 4 <= now.minute <= 6):
         return
+    today = now.strftime("%Y-%m-%d")
     for chat_id_str, cs in list(state.items()):
         try:
             chat_id = int(chat_id_str)
         except ValueError:
+            continue
+        # Fire exactly once per week
+        if cs.get("weekly_summary_sent") == today:
             continue
         try:
             msg = analyzer.format_weekly_summary(
@@ -926,6 +938,7 @@ async def weekly_summary_job(ctx: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id, text=msg, parse_mode="Markdown"
             )
             cs["signal_log"] = []
+            cs["weekly_summary_sent"] = today
             save_state(state)
         except Exception as e:
             logger.error(f"Weekly summary error {chat_id}: {e}")
