@@ -746,8 +746,10 @@ Under 100 words. Direct, factual, no fluff."""
     # ------------------------------------------------------------------ #
 
     async def run(self, ticker: str, threshold: float, force: bool = False,
-                  entry: dict = None) -> tuple:
-        """Returns (message, strength, signal_type)."""
+                  entry: dict = None, market_context: dict = None) -> tuple:
+        """Returns (message, strength, signal_type).
+        market_context can be pre-fetched once per cycle and passed in
+        to avoid redundant SPY/QQQ lookups for every ticker."""
         if not force and not is_market_open():
             return None, 0, None
 
@@ -758,7 +760,8 @@ Under 100 words. Direct, factual, no fluff."""
                 return self.format_earnings_warning(ticker, earnings), 0, "EARNINGS_BLACKOUT"
 
         price_data = await self.get_price_change(ticker)
-        market_context = await self.get_market_context()
+        if market_context is None:
+            market_context = await self.get_market_context()
         lunar = await self.get_lunarcrush_sentiment(ticker)
         sentiment = self.get_sentiment(ticker, market_context, lunar)
 
