@@ -361,6 +361,21 @@ async def resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("▶️ Resumed. Monitoring your watchlist.")
 
 
+async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    cs = get_chat_state(state, chat_id)
+    now = now_uk()
+    await update.message.reply_text(
+        f"🔧 *Debug*\n\n"
+        f"UK time now: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"morning_ping_sent: {cs.get('morning_ping_sent', 'never')}\n"
+        f"weekly_summary_sent: {cs.get('weekly_summary_sent', 'never')}\n"
+        f"paused: {cs.get('paused')}\n"
+        f"tickers: {', '.join(cs.get('tickers', []))}",
+        parse_mode="Markdown"
+    )
+
+
 async def threshold_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cs = get_chat_state(state, chat_id)
@@ -997,6 +1012,7 @@ def main():
     app.add_handler(CommandHandler("pause",     pause))
     app.add_handler(CommandHandler("resume",    resume))
     app.add_handler(CommandHandler("threshold", threshold_cmd))
+    app.add_handler(CommandHandler("debug",     debug_cmd))
 
     app.job_queue.run_repeating(scheduled_check,    interval=1800, first=60)
     app.job_queue.run_repeating(morning_ping,        interval=60,   first=30)
