@@ -28,7 +28,7 @@ FINNHUB_API_KEY    = os.environ.get("FINNHUB_API_KEY")
 
 STATE_FILE       = Path("/tmp/bot_state.json")
 COOLDOWN_HOURS   = 4
-DEFAULT_WATCHLIST = ["NVDA", "AAPL", "MA", "META", "MSFT", "TSLA"]
+DEFAULT_WATCHLIST = ["NVDA", "TSLA", "META", "AAPL"]
 
 SWEEP_TIMES_ET = {
     (9,  45): "Morning Sweep",
@@ -185,7 +185,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/list` — watchlist and positions\n"
         "• `/check NVDA` — instant deep analysis\n"
         "• `/scan` — ranked overview of full watchlist now\n"
-        "• `/brief` — morning analysis of all stocks\n"
         "• `/bought` — log a buy\n"
         "• `/sold` — log a sale\n"
         "• `/entries` — open positions\n"
@@ -264,21 +263,6 @@ async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if msg:
             await update.message.reply_text(msg, parse_mode="Markdown")
 
-
-async def brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    cs = get_chat_state(state, chat_id)
-    tickers = sorted(cs["tickers"])
-    if not tickers:
-        await update.message.reply_text("No tickers on watchlist.", parse_mode="Markdown")
-        return
-    await update.message.reply_text(f"⏳ Preparing morning brief for {', '.join(tickers)}...")
-    summary = analyzer.get_brief(tickers, cs.get("entries"))
-    now = now_uk().strftime("%b %d, %H:%M") + " UK"
-    await update.message.reply_text(
-        f"🌅 *Morning Brief — {now}*\n\n{summary}",
-        parse_mode="Markdown"
-    )
 
 
 async def entries_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -368,7 +352,6 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🔧 *Debug*\n\n"
         f"UK time now: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"morning_ping_sent: {cs.get('morning_ping_sent', 'never')}\n"
         f"weekly_summary_sent: {cs.get('weekly_summary_sent', 'never')}\n"
         f"paused: {cs.get('paused')}\n"
         f"tickers: {', '.join(cs.get('tickers', []))}",
@@ -809,6 +792,9 @@ async def thesis_follow_up(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def scheduled_check(ctx: ContextTypes.DEFAULT_TYPE):
     logger.info("Running scheduled check...")
+    # Fetch market context once per cycle — reused across all tickers/chats
+    # to avoid redundant SPY/QQQ lookups (was previously fetched per-ticker)
+    shared_market_context = await analyzer.get_market_context()
     for chat_id_str, cs in list(state.items()):
         try:
             chat_id = int(chat_id_str)
@@ -826,6 +812,7 @@ async def scheduled_check(ctx: ContextTypes.DEFAULT_TYPE):
                     threshold=get_ticker_threshold(cs, ticker),
                     force=False,
                     entry=entry,
+                    market_context=shared_market_context,
                 )
                 if not msg:
                     continue
@@ -880,53 +867,6 @@ async def scheduled_check(ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Check error {ticker}: {e}")
 
-
-async def morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
-    now = now_uk()
-    if now.weekday() >= 5:
-        return
-    if not (now.hour == 13 and 54 <= now.minute <= 56):
-        return
-    today = now.strftime("%Y-%m-%d")
-    for chat_id_str, cs in list(state.items()):
-        try:
-            chat_id = int(chat_id_str)
-        except ValueError:
-            continue
-        if cs.get("paused"):
-            continue
-        # Fire exactly once per day
-        if cs.get("morning_ping_sent") == today:
-            continue
-        try:
-            tickers = cs.get("tickers", [])
-            pulse   = analyzer.get_market_pulse(tickers, cs.get("entries"))
-            entries_note = ""
-            if cs.get("entries"):
-                entries_note = "\n📌 Open: " + ", ".join(
-                    f"{t} (${e['entry_price']})" for t, e in cs["entries"].items()
-                )
-            await ctx.application.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🌅 *Good afternoon — US market opens in 35 minutes*\n\n"
-                    f"{pulse}"
-                    f"{entries_note}"
-                ),
-                parse_mode="Markdown"
-            )
-            # Send brief as one message per stock to avoid Telegram 4096 char limit
-            for ticker in tickers:
-                ticker_brief = analyzer.get_brief([ticker], cs.get("entries"))
-                await ctx.application.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"📋 *{ticker} — Pre-Market Brief*\n\n{ticker_brief}",
-                    parse_mode="Markdown"
-                )
-            cs["morning_ping_sent"] = today
-            save_state(state)
-        except Exception as e:
-            logger.error(f"Morning ping error {chat_id}: {e}")
 
 
 async def weekly_summary_job(ctx: ContextTypes.DEFAULT_TYPE):
@@ -1005,7 +945,6 @@ def main():
     app.add_handler(CommandHandler("list",      list_cmd))
     app.add_handler(CommandHandler("check",     check))
     app.add_handler(CommandHandler("scan",      scan))
-    app.add_handler(CommandHandler("brief",     brief))
     app.add_handler(CommandHandler("entries",   entries_cmd))
     app.add_handler(CommandHandler("trades",    trades_cmd))
     app.add_handler(CommandHandler("capital",   capital_cmd))
@@ -1015,7 +954,6 @@ def main():
     app.add_handler(CommandHandler("debug",     debug_cmd))
 
     app.job_queue.run_repeating(scheduled_check,    interval=1800, first=60)
-    app.job_queue.run_repeating(morning_ping,        interval=60,   first=30)
     app.job_queue.run_repeating(weekly_summary_job,  interval=60,   first=30)
     app.job_queue.run_repeating(scheduled_sweep,     interval=60,   first=45)
 
