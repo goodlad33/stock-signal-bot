@@ -25,6 +25,7 @@ POLYGON_API_KEY    = os.environ.get("POLYGON_API_KEY")
 ALPHA_VANTAGE_KEY  = os.environ.get("ALPHA_VANTAGE_KEY")
 LUNARCRUSH_API_KEY = os.environ.get("LUNARCRUSH_API_KEY")
 FINNHUB_API_KEY    = os.environ.get("FINNHUB_API_KEY")
+FMP_API_KEY        = os.environ.get("FMP_API_KEY")
 
 STATE_FILE       = Path("/tmp/bot_state.json")
 COOLDOWN_HOURS   = 4
@@ -43,7 +44,7 @@ SWEEP_TIMES_ET = {
 analyzer = SignalAnalyzer(
     ANTHROPIC_API_KEY, POLYGON_API_KEY,
     ALPHA_VANTAGE_KEY, LUNARCRUSH_API_KEY,
-    FINNHUB_API_KEY
+    FINNHUB_API_KEY, FMP_API_KEY
 )
 
 # ------------------------------------------------------------------ #
@@ -185,6 +186,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/list` — watchlist and positions\n"
         "• `/check NVDA` — instant deep analysis\n"
         "• `/scan` — ranked overview of full watchlist now\n"
+        "• `/movers` — today's top gainers and losers across the market\n"
+        "• `/recommend` — suggested per-ticker thresholds based on volatility\n"
         "• `/bought` — log a buy\n"
         "• `/sold` — log a sale\n"
         "• `/entries` — open positions\n"
@@ -659,6 +662,30 @@ async def sold_review(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def recommended_thresholds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📊 *Recommended Per-Ticker Thresholds*\n\n"
+        "Based on each stock's typical daily volatility:\n\n"
+        "• *TSLA* — ±2.5% (highly volatile, needs room)\n"
+        "• *NVDA* — ±1.5% (volatile but more directional)\n"
+        "• *META* — ±1.2% (moderate volatility)\n"
+        "• *AAPL* — ±1.0% (steadier, lower threshold fine)\n\n"
+        "To apply, send:\n"
+        "`/threshold TSLA 2.5`\n"
+        "`/threshold NVDA 1.5`\n"
+        "`/threshold META 1.2`\n"
+        "`/threshold AAPL 1.0`\n\n"
+        "_Current global default: ±1.0%_",
+        parse_mode="Markdown"
+    )
+
+
+async def movers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Fetching today's top movers...")
+    result = await analyzer.get_market_movers()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+
 async def scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cs = get_chat_state(state, chat_id)
@@ -851,6 +878,11 @@ async def scheduled_check(ctx: ContextTypes.DEFAULT_TYPE):
                     save_state(state)
                     continue
 
+                # Suppress SELL signals unless position is held
+                if signal_type == "SELL" and not entry:
+                    logger.info(f"{ticker}: SELL signal suppressed — no open position held")
+                    continue
+
                 # Regular signal or exit trigger
                 await ctx.application.bot.send_message(
                     chat_id=chat_id, text=msg, parse_mode="Markdown"
@@ -945,6 +977,8 @@ def main():
     app.add_handler(CommandHandler("list",      list_cmd))
     app.add_handler(CommandHandler("check",     check))
     app.add_handler(CommandHandler("scan",      scan))
+    app.add_handler(CommandHandler("movers",    movers))
+    app.add_handler(CommandHandler("recommend", recommended_thresholds))
     app.add_handler(CommandHandler("entries",   entries_cmd))
     app.add_handler(CommandHandler("trades",    trades_cmd))
     app.add_handler(CommandHandler("capital",   capital_cmd))
