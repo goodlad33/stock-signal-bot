@@ -66,12 +66,64 @@ def strength_stars(strength: int) -> str:
 class SignalAnalyzer:
     def __init__(self, anthropic_key: str, polygon_key: str,
                  alpha_vantage_key: str = None, lunarcrush_key: str = None,
-                 finnhub_key: str = None):
+                 finnhub_key: str = None, fmp_key: str = None):
         self.claude = anthropic.Anthropic(api_key=anthropic_key)
         self.polygon_key = polygon_key
         self.finnhub_key = finnhub_key
+        self.fmp_key = fmp_key
         self.alpha_vantage_key = alpha_vantage_key
         self.lunarcrush_key = lunarcrush_key if lunarcrush_key != "placeholder" else None
+
+    # ------------------------------------------------------------------ #
+    #  MARKET MOVERS — FMP gainers/losers                                 #
+    # ------------------------------------------------------------------ #
+
+    async def get_market_movers(self) -> str:
+        """
+        Fetches top gainers and losers from FMP free tier.
+        Returns a formatted Telegram message.
+        No Claude calls — pure data fetch, zero AI cost.
+        """
+        if not self.fmp_key:
+            return "⚠️ FMP API key not configured. Add FMP_API_KEY to Railway variables."
+
+        now = now_uk().strftime("%b %d, %H:%M") + " UK"
+        base = "https://financialmodelingprep.com/api/v3"
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                g_resp = await client.get(f"{base}/stock_market/gainers",
+                                          params={"apikey": self.fmp_key})
+                l_resp = await client.get(f"{base}/stock_market/losers",
+                                          params={"apikey": self.fmp_key})
+
+            gainers = g_resp.json()[:5] if isinstance(g_resp.json(), list) else []
+            losers  = l_resp.json()[:5] if isinstance(l_resp.json(), list) else []
+
+            lines = [f"🔥 *Market Movers — {now}*\n"]
+
+            lines.append("📈 *Top Gainers*")
+            for s in gainers:
+                sym  = s.get("symbol", "?")
+                pct  = s.get("changesPercentage", 0)
+                price = s.get("price", 0)
+                lines.append(f"  • *{sym}* +{pct:.1f}% · ${price:.2f}")
+
+            lines.append("\n📉 *Top Losers*")
+            for s in losers:
+                sym  = s.get("symbol", "?")
+                pct  = s.get("changesPercentage", 0)
+                price = s.get("price", 0)
+                lines.append(f"  • *{sym}* {pct:.1f}% · ${price:.2f}")
+
+            lines.append(
+                "\n_Use /check TICKER to run deep analysis on any of these._"
+            )
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"FMP movers error: {e}")
+            return "⚠️ Could not retrieve market movers. Try again shortly."
 
     # ------------------------------------------------------------------ #
     #  PRICE DATA                                                          #
